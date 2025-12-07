@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ArrowRight, Globe, Search } from 'lucide-react';
+import { ArrowRight, Globe } from 'lucide-react';
 
 interface UrlInputProps {
   onAnalyze: (url: string) => void;

@@ -7,46 +7,171 @@ const getClient = () => {
   return new GoogleGenAI({ apiKey });
 };
 
-export const analyzeBrandFromUrl = async (url: string): Promise<BrandStyle> => {
+// Demo Data for Fallback/Testing
+export const getDemoBrandStyle = (): BrandStyle => ({
+  brandName: "NeonFlux",
+  themeDescription: "Cyberpunk aesthetic with high-contrast neon accents against deep void black.",
+  dominantColors: ["#09090B", "#00F0FF", "#7000FF", "#FF003C", "#FFFFFF"],
+  fontStyle: "Futuristic Sans-Serif (Orbitron/Inter)",
+  layoutVibe: "Asymmetrical grid, glowing borders, glitch effects"
+});
+
+// Helper to fetch screenshot and convert to base64
+async function fetchScreenshotBase64(url: string, onLog?: (msg: string) => void): Promise<string | null> {
+  try {
+    onLog?.(`Initiating screenshot capture for ${url}...`);
+    // Normalize URL
+    const targetUrl = url.startsWith('http') ? url : `https://${url}`;
+    
+    // Using thum.io as a screenshot service. 
+    const screenshotUrl = `https://image.thum.io/get/width/1024/crop/800/noanimate/${targetUrl}`;
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000); // 8 second timeout for screenshot
+
+    onLog?.("Sending request to screenshot service...");
+    const response = await fetch(screenshotUrl, { signal: controller.signal });
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      onLog?.(`Screenshot service returned status: ${response.status}`);
+      return null;
+    }
+    
+    const blob = await response.blob();
+    // Basic check to ensure we got an image
+    if (!blob.type.startsWith('image/')) {
+       onLog?.(`Invalid content type received: ${blob.type}`);
+       return null;
+    }
+
+    onLog?.("Screenshot captured successfully. Converting to Base64...");
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const res = reader.result as string;
+        if (!res) {
+          onLog?.("FileReader result is empty.");
+          resolve(null as any);
+          return;
+        }
+        // Strip the data:image/png;base64, part if present
+        resolve(res.split(',')[1]); 
+      };
+      reader.onerror = () => {
+        onLog?.("Failed to read blob data.");
+        resolve(null as any);
+      }
+      reader.readAsDataURL(blob); 
+    });
+  } catch (e) {
+    onLog?.(`Screenshot failed (using text fallback): ${e instanceof Error ? e.message : 'Unknown error'}`);
+    console.warn("Screenshot fetch failed or timed out, falling back to text analysis:", e);
+    return null;
+  }
+}
+
+export const analyzeBrandFromUrl = async (url: string, onLog?: (msg: string) => void): Promise<BrandStyle> => {
   const ai = getClient();
   
-  const prompt = `
+  onLog?.("Step 1: Fetching visual context...");
+  const screenshotBase64 = await fetchScreenshotBase64(url, onLog);
+  
+  const inputParts: any[] = [];
+  
+  if (screenshotBase64) {
+    onLog?.("Visual context acquired. Attaching image to prompt.");
+    inputParts.push({
+      inlineData: {
+        mimeType: 'image/png',
+        data: screenshotBase64
+      }
+    });
+  } else {
+    onLog?.("No visual context available. Proceeding with text/search analysis.");
+  }
+
+  let prompt = `
     Analyze the brand and visual style of the website: ${url}.
-    Use Google Search to find information about the brand's logo, colors, and design language.
-    If the website is not well-known, infer a suitable style based on the domain name and industry standards for that type of site.
-    
-    Return a JSON object with:
-    - brandName: The name of the brand.
-    - themeDescription: A concise description of the visual theme (e.g., 'futuristic cyber-security dark mode with neon accents').
-    - dominantColors: An array of 5-7 hex color codes representing the palette.
-    - fontStyle: A description of the typography (e.g., 'Clean geometric sans-serif').
-    - layoutVibe: The structural feel (e.g., 'Grid-based masonry', 'Minimalist single column').
   `;
 
-  const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash",
-    contents: prompt,
+  if (screenshotBase64) {
+    prompt += `
+    I have provided a screenshot of the website. 
+    1. ANALYZE the image to determine the dominant color palette (extract hex codes from the image pixels).
+    2. OBSERVE the layout structure (hero section, navigation, density).
+    3. DETECT the typography style (serif vs sans-serif, weights, mood).
+    If the image appears to be a "loading" placeholder or "screenshot failed" image, IGNORE the image and use Google Search instead.
+    `;
+  } else {
+    prompt += `
+    Use Google Search to find information about the brand's logo, colors, and design language.
+    `;
+  }
+
+  prompt += `
+    If the website is not well-known, infer a suitable style based on the domain name and industry standards.
+    
+    Return a VALID JSON object (no markdown, just raw JSON) with the following specific structure:
+    {
+      "brandName": "Name of the brand",
+      "themeDescription": "A concise description of the visual theme",
+      "dominantColors": ["#hex1", "#hex2", "#hex3", "#hex4", "#hex5"],
+      "fontStyle": "Description of typography",
+      "layoutVibe": "Description of layout structure"
+    }
+  `;
+
+  inputParts.push({ text: prompt });
+
+  onLog?.("Step 2: Sending request to Gemini 3 Pro...");
+
+  // IMPORTANT: We set a timeout for the Gemini call itself
+  // Increased to 40s for Gemini 3 Pro multimodal latency
+  const geminiPromise = ai.models.generateContent({
+    model: "gemini-3-pro-preview",
+    contents: {
+      parts: inputParts
+    },
     config: {
       tools: [{ googleSearch: {} }],
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          brandName: { type: Type.STRING },
-          themeDescription: { type: Type.STRING },
-          dominantColors: { type: Type.ARRAY, items: { type: Type.STRING } },
-          fontStyle: { type: Type.STRING },
-          layoutVibe: { type: Type.STRING },
-        },
-        required: ["brandName", "themeDescription", "dominantColors", "fontStyle", "layoutVibe"],
-      },
     },
   });
 
-  const text = response.text;
-  if (!text) throw new Error("Failed to analyze brand.");
-  
-  return JSON.parse(text) as BrandStyle;
+  // Timeout wrapper
+  const timeoutPromise = new Promise((_, reject) => 
+    setTimeout(() => reject(new Error("Gemini API timed out after 40s")), 40000)
+  );
+
+  try {
+    const response: any = await Promise.race([geminiPromise, timeoutPromise]);
+    
+    onLog?.("Gemini response received.");
+    let text = response.text;
+    
+    if (!text) {
+      onLog?.("Error: Empty text response from Gemini.");
+      throw new Error("Failed to analyze brand.");
+    }
+    
+    onLog?.("Step 3: Parsing analysis results...");
+    // Clean up potential markdown code blocks
+    text = text.replace(/```json\n?/g, '').replace(/```/g, '').trim();
+
+    try {
+      const result = JSON.parse(text) as BrandStyle;
+      onLog?.("Analysis complete. Style definition ready.");
+      return result;
+    } catch (e) {
+      console.error("Failed to parse JSON response:", text);
+      onLog?.("Error: Invalid JSON format received.");
+      throw new Error("Failed to parse brand analysis results.");
+    }
+
+  } catch (error: any) {
+    onLog?.(`Critical Error: ${error.message}`);
+    throw error;
+  }
 };
 
 export const generateLogoVariant = async (
@@ -64,12 +189,15 @@ export const generateLogoVariant = async (
   `;
 
   const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash-image",
-    contents: prompt,
+    model: "gemini-3-pro-image-preview",
+    contents: {
+      parts: [{ text: prompt }]
+    },
     config: {
-      // @ts-ignore - 'imageConfig' types might be strict in some versions, but this structure is correct for 2.5-flash-image
+      // @ts-ignore
       imageConfig: {
         aspectRatio: "1:1",
+        imageSize: "1K"
       }
     }
   });
@@ -95,46 +223,54 @@ export const generateLogoVariant = async (
   };
 };
 
-export const generateSocialMock = async (
+export const generateBrandAsset = async (
   style: BrandStyle,
-  platform: 'Instagram' | 'Twitter' | 'LinkedIn'
+  type: 'Billboard' | 'Merch' | 'Poster'
 ): Promise<GeneratedAsset> => {
   const ai = getClient();
   
   let aspectRatio = "1:1";
-  let desc = "";
+  let promptDetails = "";
 
-  switch (platform) {
-    case 'Instagram':
-      aspectRatio = "1:1";
-      desc = "An engaging Instagram social media post.";
-      break;
-    case 'Twitter':
+  switch (type) {
+    case 'Billboard':
       aspectRatio = "16:9";
-      desc = "A professional Twitter header banner.";
+      promptDetails = `A photorealistic wide urban billboard advertisement for "${style.brandName}". 
+      High-end 3D city context. Clean, bold typography. `;
       break;
-    case 'LinkedIn':
-      aspectRatio = "16:9"; // LinkedIn covers are roughly this or slimmer, but 16:9 is safe standard
-      desc = "A corporate LinkedIn cover photo.";
+    case 'Merch':
+      aspectRatio = "3:4"; 
+      promptDetails = `A high-fashion streetwear hoodie mockup featuring the "${style.brandName}" logo. 
+      Professional studio lighting, model wearing the merchandise, lifestyle photography. `;
+      break;
+    case 'Poster':
+      aspectRatio = "9:16";
+      promptDetails = `A Swiss-style graphic design poster for "${style.brandName}". 
+      Vertical format, bold typography, abstract geometric shapes based on brand colors. Artsy and modern.`;
       break;
   }
 
   const prompt = `
-    Create a ${desc} for the brand "${style.brandName}".
-    Theme: ${style.themeDescription}.
-    Typography: ${style.fontStyle}.
-    Colors: ${style.dominantColors.join(', ')}.
-    Content: Include placeholder text and abstract visual elements fitting the theme.
-    Make it look like a high-quality, ready-to-use template.
+    Create a ${promptDetails}
+    
+    Brand Identity:
+    - Theme: ${style.themeDescription}
+    - Colors: ${style.dominantColors.join(', ')}
+    - Vibe: ${style.layoutVibe}
+    
+    Make it look like a high-budget professional brand asset.
   `;
 
   const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash-image",
-    contents: prompt,
+    model: "gemini-3-pro-image-preview",
+    contents: {
+      parts: [{ text: prompt }]
+    },
     config: {
        // @ts-ignore
        imageConfig: {
         aspectRatio: aspectRatio,
+        imageSize: "1K"
       }
     }
   });
@@ -149,13 +285,13 @@ export const generateSocialMock = async (
     }
   }
 
-  if (!imageUrl) throw new Error("Failed to generate social mock");
+  if (!imageUrl) throw new Error(`Failed to generate ${type}`);
 
   return {
-    id: `social-${platform}-${Date.now()}`,
-    type: 'social',
-    subtype: platform,
+    id: `asset-${type}-${Date.now()}`,
+    type: 'social', // keeping type as social for asset grid compatibility, though 'brand' might be better conceptually
+    subtype: type,
     imageUrl,
-    description: `${platform} Template`,
+    description: `${type} Mockup`,
   };
 };
